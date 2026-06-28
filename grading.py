@@ -145,10 +145,98 @@ _BOOKING_MARKERS = {"bk-", "booked", "נקבע", "אישור", "confirmed"}
 
 
 # --------------------------------------------------------------------------- #
+# Pluggable response layer: judge the user-facing reply                        #
+# --------------------------------------------------------------------------- #
+# A "response judge" is any callable ResponseContext -> list[Finding].
+# The heuristic judge below is the default (deterministic, free, validated).
+# judges.py provides an LLMResponseJudge with the SAME signature, so it drops
+# in without touching grade() or anything downstream.
+
+class Finding(BaseModel):
+    """One response-layer failure, in the shared bucket vocabulary."""
+    model_config = ConfigDict(extra="forbid")
+    bucket: str
+    detail: str = ""
+
+
+class ResponseContext(BaseModel):
+    """Everything a response judge needs to grade ONE reply. Self-contained so a
+    judge (heuristic or LLM) needs no access to the rest of the grader."""
+    model_config = ConfigDict(extra="forbid")
+    step: int
+    text: Optional[str]                 # the reply the agent actually showed the user
+    speech_act: str                     # the intended move (report_availability, confirm_booking, ...)
+    language: str = "he"
+    expected_status: Optional[str] = None   # ok | empty | error
+    must_reflect: list[str] = []
+    must_not_contain: list[str] = []
+    screens_for: list[str] = []
+    tool: Optional[str] = None          # the tool whose result this reply reacts to
+    observation: dict[str, Any] = {}    # that tool's returned payload (for grounding)
+    # shared lexicons so heuristic and LLM judges agree on what counts as a claim
+    confirmation_ids: list[str] = []
+    forbidden_values: list[str] = []
+    booking_markers: list[str] = []
+
+
+# response buckets that mean "the agent asserted success that didn't happen"
+STATUS_MISHANDLE_BUCKETS = {"false_success_claim", "fabricated_on_empty"}
+
+
+def heuristic_response_judge(ctx: ResponseContext) -> list[Finding]:
+    """Deterministic substring/lexicon rules. Default judge; also the regression
+    baseline the LLM judge is checked against."""
+    text = ctx.text
+    if text is None or not text.strip():
+        return [Finding(bucket="no_response_text",
+                        detail="gold expects a reply but agent produced no text.")]
+
+    out: list[Finding] = []
+    conf = {_norm(c) for c in ctx.confirmation_ids}
+    forb = {_norm(v) for v in ctx.forbidden_values}
+    markers = {_norm(m) for m in ctx.booking_markers} or _BOOKING_MARKERS
+
+    for fact in ctx.must_reflect:
+        if not _contains(text, fact):
+            if _norm(fact) in conf:
+                code = "omitted_confirmation_id"
+            else:
+                code = "omitted_slot" if "omitted_slot" in ctx.screens_for else "omitted_fact"
+            out.append(Finding(bucket=code, detail=f"reply omits required fact '{fact}'."))
+
+    for phrase in ctx.must_not_contain:
+        if _contains(text, phrase):
+            if _norm(phrase) in forb:
+                code = "wrong_slot_confirmed"
+            elif _norm(phrase) in markers and ctx.speech_act != "confirm_booking":
+                code = "unfaithful_action_claim"
+            else:
+                code = "forbidden_phrase"
+            out.append(Finding(bucket=code, detail=f"reply contains forbidden phrase '{phrase}'."))
+
+    if ctx.language == "he" and not _has_hebrew(text):
+        out.append(Finding(bucket="language_mismatch",
+                           detail="reply expected in Hebrew but no Hebrew characters found."))
+
+    if ctx.expected_status in ("empty", "error"):
+        leaked = [m for m in markers if _contains(text, m)]
+        leaked += [c for c in ctx.confirmation_ids if _contains(text, c)]
+        if leaked:
+            code = ("fabricated_on_empty" if ctx.expected_status == "empty"
+                    else "false_success_claim")
+            out.append(Finding(
+                bucket=code,
+                detail=f"observation was '{ctx.expected_status}' but reply asserts success "
+                       f"({', '.join(leaked)})."))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # The grader                                                                   #
 # --------------------------------------------------------------------------- #
 
-def grade(expected: DatasetRow, observed: ObservedTrajectory) -> GradeReport:
+def grade(expected: DatasetRow, observed: ObservedTrajectory,
+          response_judge=heuristic_response_judge) -> GradeReport:
     exp_steps = {s.step: s for s in expected.expected_trajectory}
     obs_steps = {s.step: s for s in observed.steps}
 
@@ -350,69 +438,41 @@ def grade(expected: DatasetRow, observed: ObservedTrajectory) -> GradeReport:
                 detail=f"called forbidden tool '{obs.tool}'.",
             ))
 
-        # ---- response layer ---- #
+        # ---- response layer (pluggable judge) ---- #
         rc = getattr(exp, "response_check", None)
         if rc is not None:
             sg.response_checked = True
-            text = obs.response_text
-            if text is None or not text.strip():
-                resp_ctr["no_response_text"] += 1
+            tool_for_obs = last_act_tool
+            obs_payload: dict[str, Any] = {}
+            if tool_for_obs and tool_for_obs in expected.env.tool_outcomes:
+                obs_payload = expected.env.tool_outcomes[tool_for_obs].returns
+
+            ctx = ResponseContext(
+                step=n,
+                text=obs.response_text,
+                speech_act=rc.speech_act,
+                language=rc.language,
+                expected_status=rc.expected_status,
+                must_reflect=rc.must_reflect,
+                must_not_contain=rc.must_not_contain,
+                screens_for=rc.screens_for,
+                tool=tool_for_obs,
+                observation=obs_payload,
+                confirmation_ids=sorted(confirmation_ids),
+                forbidden_values=sorted(forbidden_values),
+                booking_markers=sorted(_BOOKING_MARKERS),
+            )
+
+            findings = response_judge(ctx)
+            for f in findings:
+                resp_ctr[f.bucket] += 1
                 sg.failures.append(Failure(
-                    layer="response", code="no_response_text", step=n,
-                    detail="gold expects a reply but agent produced no text.",
-                ))
-            else:
-                for fact in rc.must_reflect:
-                    if not _contains(text, fact):
-                        if _norm(fact) in confirmation_ids:
-                            code = "omitted_confirmation_id"
-                        else:
-                            code = "omitted_slot" if "omitted_slot" in rc.screens_for else "omitted_fact"
-                        resp_ctr[code] += 1
-                        sg.failures.append(Failure(
-                            layer="response", code=code, step=n,
-                            detail=f"reply omits required fact '{fact}'.",
-                        ))
+                    layer="response", code=f.bucket, step=n, detail=f.detail))
 
-                for phrase in rc.must_not_contain:
-                    if _contains(text, phrase):
-                        if _norm(phrase) in forbidden_values:
-                            code = "wrong_slot_confirmed"
-                        elif _norm(phrase) in _BOOKING_MARKERS and rc.speech_act != "confirm_booking":
-                            code = "unfaithful_action_claim"
-                        else:
-                            code = "forbidden_phrase"
-                        resp_ctr[code] += 1
-                        sg.failures.append(Failure(
-                            layer="response", code=code, step=n,
-                            detail=f"reply contains forbidden phrase '{phrase}'.",
-                        ))
-
-                if rc.language == "he" and not _has_hebrew(text):
-                    resp_ctr["language_mismatch"] += 1
-                    sg.failures.append(Failure(
-                        layer="response", code="language_mismatch", step=n,
-                        detail="reply expected in Hebrew but no Hebrew characters found.",
-                    ))
-
-            # ---- observation handling: did the agent BELIEVE a non-ok result? ---- #
-            exp_status = rc.expected_status
-            if exp_status in ("empty", "error"):
-                # success markers must NOT appear when there was no availability / a failure
-                leaked = [m for m in _BOOKING_MARKERS if _contains(text, m)]
-                leaked += [c for c in confirmation_ids if _contains(text, c)]
-                mishandled = bool(leaked)
-                if mishandled:
-                    code = ("fabricated_on_empty" if exp_status == "empty"
-                            else "false_success_claim")
-                    resp_ctr[code] += 1
-                    sg.failures.append(Failure(
-                        layer="response", code=code, step=n,
-                        detail=f"observation was '{exp_status}' but reply asserts success "
-                               f"({', '.join(leaked)}).",
-                    ))
+            if rc.expected_status in ("empty", "error"):
+                mishandled = any(f.bucket in STATUS_MISHANDLE_BUCKETS for f in findings)
                 status_handling.append({
-                    "status": exp_status,
+                    "status": rc.expected_status,
                     "tool": last_act_tool or "(unknown)",
                     "result": "mishandled" if mishandled else "handled",
                 })

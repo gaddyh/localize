@@ -14,6 +14,10 @@ Run:  python report.py
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from sklearn.metrics import classification_report, confusion_matrix
 from rich import box
 from rich.console import Console
@@ -209,15 +213,23 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] in ("gen", "validate"):
         from generators import build_dataset, validate
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+        use_llm = "llm" in sys.argv
+        judge = None
+        if use_llm:
+            from judges import default_judge
+            judge = default_judge()
         cases, profile = build_dataset(n_per_cell=n, seed=7)
-        reports = [grade(gold, observed) for _, gold, observed in cases]
+        reports = [grade(gold, observed,
+                         **({"response_judge": judge} if judge else {}))
+                   for _, gold, observed in cases]
+        tag = " [LLM judge]" if use_llm else ""
         if sys.argv[1] == "validate":
-            console.rule(f"[bold]Grader validation ({len(cases)} runs)[/bold]")
+            console.rule(f"[bold]Grader validation ({len(cases)} runs){tag}[/bold]")
             rows = validate(cases, reports, profile)
             render_validation(console, rows, len(cases))
             console.print(f"[dim]injected agent profile: {profile}[/dim]")
         else:
-            run(reports, console, f"Generated volume ({len(cases)} runs)")
+            run(reports, console, f"Generated volume ({len(cases)} runs){tag}")
             console.print(f"\n[dim]injected agent profile: {profile}[/dim]")
     else:
         reports = [grade(gold, observed) for _, gold, observed in CASES]
