@@ -136,7 +136,7 @@ Validate the ruler first, then measure with it.
 
 ## Learn more
 
-- **[docs/design.md](docs/design.md)** — the full rationale: how the schema and scenarios
+- **[docs/design.md](docs/Design.md)** — the full rationale: how the schema and scenarios
   were *derived* (not decreed), how "deterministic variety" works, why the self-validation
   isn't circular, and the LLM-judge design.
 - Inspired by [τ²-bench](https://github.com/sierra-research/tau2-bench) (Sierra Research &
