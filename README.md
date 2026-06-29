@@ -19,6 +19,11 @@ Plus tool-choice and tool-result-status checks, and a **self-validation mode** t
 proves the grader itself is trustworthy before you point it at a real model — the same
 mode that caught a faulty LLM judge during development (see below).
 
+> "Independent" means each failure is *attributed to one layer*, not that one bad decision
+> can't cascade. A wrong tool call often drags args and response down with it — which is
+> exactly why per-layer scoring is useful: it lets you trace the cascade back to its
+> root layer instead of seeing five symptoms and guessing.
+
 ---
 
 ## Why this exists
@@ -257,7 +262,7 @@ validator checks). That second job is what makes the whole self-validation idea 
 
 ---
 
-## What's in the box (7 files, ~2.5k LOC, no framework)
+## What's in the box (9 files, ~4k LOC, no framework)
 
 | File | Role |
 |---|---|
@@ -274,13 +279,13 @@ validator checks). That second job is what makes the whole self-validation idea 
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/localize.git
+git clone https://github.com/gaddyh/localize.git
 cd localize
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-python report.py             # dashboard over the 10 curated runs
-python report.py gen 20      # generate 140 runs and report on them
+python report.py             # the 10 CURATED runs (hand-written, readable, real)
+python report.py gen 20      # 140 GENERATED runs (volume, for stable metrics)
 python report.py validate 20 # prove the grader is faithful (injected vs measured)
 
 # meaning-aware LLM judge for the response layer:
@@ -288,6 +293,10 @@ python demo_llm_judge.py     # heuristic misses a paraphrase; the LLM judge catc
 python report.py gen 20 llm  # full dashboard, replies graded by the LLM judge
 python report.py validate 20 llm  # validate the grader WITH the LLM judge in the loop
 ```
+
+`report.py` (no args) reads the curated seeds in `examples_dataset.py` — a handful of
+real, hand-written cases you can read end to end. `gen N` generates `N × 7` runs for
+metrics that don't wobble on small samples. Same grader, same report, both ways.
 
 Requires Python 3.10+. Dependencies: `pydantic`, `rich`, `scikit-learn` (and an LLM SDK
 + `*_API_KEY` only if you use the real LLM-judge backend; without a key it falls back to
@@ -334,14 +343,57 @@ should come from, so the grader can file the failure precisely:
 
 Behavior (act/clarify/respond), arguments (with the provenance buckets above), and the
 **response text** the user sees (`must_reflect` facts present? `must_not_contain` traps
-tripped? did it claim success after a tool error?). Tool-choice and a loose end-state
-`outcome_check` round it out.
+tripped? did it claim success after a tool error?). Two more surfaces wrap these: a
+**tool-choice** check (which tool, not just act-vs-clarify) and a loose end-state
+**`outcome_check`** — so it's really three per-step layers plus two cross-cutting ones,
+five scored surfaces in total.
 
 ### 4. The report turns runs into a profile
 
 Behavior and tool-choice **confusion matrices** (via `sklearn`), per-class
 precision/recall/F1, an **observation-handling** table (right tool, wrong belief about
 the result), and **per-layer clean-rates** that tell you which layer to fix first.
+
+### What a run actually looks like
+
+`python report.py gen 20` (140 simulated runs, default profile). Abridged:
+
+```
+───────────────────── Generated volume (140 runs) ──────────────────────
+rows: 140   strict_pass_rate: 0.414   outcome_pass_rate: 0.793
+
+        Behavior confusion (Act / Clarify / Respond)
+  gold \ pred   act   clarify   respond   (none)   support
+          act   140         ·         ·        ·       140
+      clarify    12        28         ·        ·        40     <- 12 eager-acts
+      respond     ·         ·       129       11       140     <- 11 premature stops
+
+         class   precision   recall      f1   support
+           act       0.921    1.000   0.959       140
+       clarify       1.000    0.700   0.824        40
+
+                 Tool-choice confusion
+  gold \ pred   book   cancel   check   (no_call)   support
+         book     51        3       6           ·        60
+       cancel      ·       20       ·           ·        20
+        check      7        5      48           ·        60     <- check mis-fired as book/cancel
+
+    Observation handling by result status (right tool, wrong belief)
+                tool   result status   handled   mishandled   handling_acc
+    book_appointment           error        13            5          0.722
+  check_availability           empty        12            7          0.632
+
+       Clean-rate by localization layer
+     layer   applicable   clean   clean_rate
+  behavior          309     297        0.961     <- healthy
+       arg          140     114        0.814
+  response          169     122        0.722     <- weakest layer
+```
+
+Read it as a diagnosis: *behavior* is healthy (0.96), the damage is in *arguments* and
+*responses*, and within those the worst single thing is **observation handling** — when a
+tool returns `empty`/`error`, the agent still claims success ~30% of the time. That
+sentence is the deliverable. A bare "41% strict pass" would have hidden all of it.
 
 ---
 
@@ -375,6 +427,34 @@ def test_grader_is_faithful():
     reports = [grade(g, o) for _, g, o in cases]
     assert all(r["pass"] for r in validate(cases, reports, profile))
 ```
+
+**Why these five knobs and not every bucket?** The validator checks the failure modes the
+simulator *injects directly and countably* — one clean Bernoulli trial per opportunity.
+The grader emits many more buckets (`forbidden_tool`, `wrong_slot_confirmed`,
+`omitted_confirmation_id`, …), but those are **downstream consequences** of the injected
+modes (an eager-act *causes* a forbidden-tool and a fabricated arg), not independently
+dialed rates — so there's no clean injected number to check them against. The five are the
+levers with a known ground truth; the rest ride along.
+
+### "Isn't this circular?" — no, and here's why
+
+The fair objection: the simulator and the grader were written by the same person against
+the same gold, so couldn't a shared wrong assumption make validation pass while both are
+wrong together? The reason it isn't circular is that the two sides reach the verdict by
+**independent mechanisms**:
+
+- the **simulator** injects an error by *mutating a trajectory* — swap a tool, shift a
+  date, truncate a step — driven by a probability it was told;
+- the **grader** detects an error by *comparing the observed trajectory against gold* and
+  bucketing the diff — it never sees the profile or which step was mutated.
+
+For validation to pass *spuriously*, a bug would have to corrupt the injection and the
+detection in the **same direction by the same amount** — far less likely than either being
+simply wrong. This isn't hypothetical hand-waving: the `false_success` bug (37 vs ~15)
+passed every *other* knob and failed loudly on exactly the one that broke, because the
+mechanisms diverged there. The validator can't prove the gold encodes the *right* policy
+(that's a human judgement), but it does prove the grader faithfully measures whatever the
+gold says — which is the part that silently rots otherwise.
 
 ### This isn't hypothetical — it caught a real bug
 
@@ -479,6 +559,10 @@ the ruler *first*, then measure with it.
 - **The offline judge backend is a crude imitation.** It exists only to exercise the judge
   *interface* without a key; its judgments are not a real model's. Use a real backend
   (set the API key) for actual grading.
+- **LLM-judge cost & runtime.** The judge fires once per *respond* step, not per run, so
+  `validate 20` (140 runs, ~140 respond steps) is roughly 140 small calls — seconds to a
+  couple of minutes and cents, not dollars, on a small judge model. Scale linearly with N;
+  the heuristic path is free and instant if you just want the structure.
 - **Validation covers injected modes only.** The self-check verifies the failure modes the
   simulator produces. Perfect scores on some confusion cells (e.g. `act` recall) reflect
   that the simulator never produces those errors — not that the grader is infallible.
