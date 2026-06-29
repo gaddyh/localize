@@ -114,6 +114,52 @@ purpose, by a controlled amount.
 
 ---
 
+## Where the scenarios came from (the tool registry × a completeness ladder)
+
+The scenario list (`check_ok`, `book_ok`, `book_time_missing`, `cancel_ok`, …) isn't a
+guess at "things that might go wrong." Like the schema, it was *derived* — by taking the
+agent's **tool registry** and crossing it with an **argument-completeness ladder**.
+
+Start from the tools the agent actually has and their required args:
+
+```
+check_availability(service, date_range)
+book_appointment(service, date, time, customer_name)
+cancel_appointment(date, time)
+```
+
+Then, for each tool, walk the ladder of *how much the user has supplied so far* — because
+that is precisely what decides **Act vs Clarify**, the core behavior axis:
+
+| rung | what the user gave | correct behavior |
+|---|---|---|
+| all args present | everything the tool needs | **Act** (call the tool) |
+| 1 arg missing | enough to know the intent, not to act | **Clarify** (ask for the one gap) |
+| 2+ args missing | barely-specified request | **Clarify** (ask for the most informative gap) |
+
+That cross-product *is* the scenario grid. `book_appointment` with all four args →
+`book_ok` (Act); `book_appointment` missing `time` → `book_time_missing` (Clarify);
+`check_availability` missing `service` → `check_service_missing` (Clarify). Each cell is a
+distinct, nameable test of one decision — and crucially, the **forbidden** block on a
+"missing" cell is what catches *eager acting* (calling the tool anyway with a fabricated
+value instead of asking).
+
+Two more axes layer on top of completeness, once the basic grid exists:
+
+- **Tool-result status** — for a tool that *can* act, what did it *return*? `ok` (slots
+  found / booking confirmed), `empty` (no availability), or `error` (booking rejected).
+  This is the `*_ok` vs `check_empty` vs `book_error` split, and it's what surfaces the
+  "right tool, wrong belief about the result" failure (claiming success after an error).
+- **Input ambiguity** — beyond *missing*, an arg can be *present but unclear* (an ambiguous
+  service term, a relative date with two readings). That's a natural next rung on the same
+  ladder, sitting between "present" and "missing," and a clean place to extend the grid.
+
+So the scenarios are the systematic enumeration of *(tool) × (how complete the request is)
+× (what the tool returns)* — not a wish-list. New tool? Add its rows. New failure surface?
+Add an axis. The grid tells you exactly which cells you haven't covered yet.
+
+---
+
 ## "Deterministic variety" — how that isn't a contradiction
 
 The thing that trips people up: *how do you generate many different examples and have it
