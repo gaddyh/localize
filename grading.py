@@ -20,6 +20,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, field_validator
 
 try:  # works when run as a script from the same directory
+    from contract import Contract
     from dataset_models import (
         ActStep,
         ArgSource,
@@ -29,6 +30,7 @@ try:  # works when run as a script from the same directory
         RespondStep,
     )
 except ImportError:  # works when imported as part of a package
+    from .contract import Contract  # type: ignore
     from .dataset_models import (  # type: ignore
         ActStep,
         ArgSource,
@@ -137,11 +139,16 @@ def _contains(haystack: Optional[str], needle: Any) -> bool:
     return _norm(needle) in _norm(haystack)
 
 
-def _has_hebrew(s: str) -> bool:
-    return any("\u0590" <= c <= "\u05FF" for c in s)
-
-
-_BOOKING_MARKERS = {"bk-", "booked", "נקבע", "אישור", "confirmed"}
+def _has_script_chars(s: str, language: str) -> bool:
+    """Check whether *s* contains characters in the script for *language*.
+    Generic replacement for the old _has_hebrew helper."""
+    script_ranges = {
+        "he": ("\u0590", "\u05FF"),
+        "ar": ("\u0600", "\u06FF"),
+        "ru": ("\u0400", "\u04FF"),
+    }
+    lo, hi = script_ranges.get(language, ("\u0000", "\uFFFF"))
+    return any(lo <= c <= hi for c in s)
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +201,7 @@ def heuristic_response_judge(ctx: ResponseContext) -> list[Finding]:
     out: list[Finding] = []
     conf = {_norm(c) for c in ctx.confirmation_ids}
     forb = {_norm(v) for v in ctx.forbidden_values}
-    markers = {_norm(m) for m in ctx.booking_markers} or _BOOKING_MARKERS
+    markers = {_norm(m) for m in ctx.booking_markers}
 
     for fact in ctx.must_reflect:
         if not _contains(text, fact):
@@ -214,7 +221,7 @@ def heuristic_response_judge(ctx: ResponseContext) -> list[Finding]:
                 code = "forbidden_phrase"
             out.append(Finding(bucket=code, detail=f"reply contains forbidden phrase '{phrase}'."))
 
-    if ctx.language == "he" and not _has_hebrew(text):
+    if ctx.language and not _has_script_chars(text, ctx.language):
         out.append(Finding(bucket="language_mismatch",
                            detail="reply expected in Hebrew but no Hebrew characters found."))
 
@@ -236,6 +243,7 @@ def heuristic_response_judge(ctx: ResponseContext) -> list[Finding]:
 # --------------------------------------------------------------------------- #
 
 def grade(expected: DatasetRow, observed: ObservedTrajectory,
+          contract: Contract,
           response_judge=heuristic_response_judge) -> GradeReport:
     exp_steps = {s.step: s for s in expected.expected_trajectory}
     obs_steps = {s.step: s for s in observed.steps}
@@ -253,10 +261,12 @@ def grade(expected: DatasetRow, observed: ObservedTrajectory,
                 forbidden_values.update(_norm(v) for v in vals)
 
     # confirmation ids the env will return (for omitted_confirmation_id detection)
+    # Scan tool_outcomes for keys in contract.success_fields where the value is a str
+    # (guards against dict-valued fields like "cancelled").
     confirmation_ids: set[str] = set()
     for outcome in expected.env.tool_outcomes.values():
         for k, v in outcome.returns.items():
-            if "confirmation" in k.lower() and isinstance(v, str):
+            if k in contract.success_fields and isinstance(v, str):
                 confirmation_ids.add(_norm(v))
 
     step_grades: list[StepGrade] = []
@@ -460,7 +470,7 @@ def grade(expected: DatasetRow, observed: ObservedTrajectory,
                 observation=obs_payload,
                 confirmation_ids=sorted(confirmation_ids),
                 forbidden_values=sorted(forbidden_values),
-                booking_markers=sorted(_BOOKING_MARKERS),
+                booking_markers=sorted(contract.success_lexicon),
             )
 
             findings = response_judge(ctx)
@@ -480,7 +490,7 @@ def grade(expected: DatasetRow, observed: ObservedTrajectory,
         step_grades.append(sg)
 
     # --- loose outcome check ---------------------------------------------- #
-    outcome_failures = _check_outcome(expected, observed, resp_ctr)
+    outcome_failures = _check_outcome(expected, observed, resp_ctr, contract)
 
     strict_pass = (
         not traj_failures
@@ -504,23 +514,33 @@ def grade(expected: DatasetRow, observed: ObservedTrajectory,
 
 
 def _check_outcome(expected: DatasetRow, observed: ObservedTrajectory,
-                   resp_ctr: Counter) -> list[Failure]:
+                   resp_ctr: Counter, contract: Contract) -> list[Failure]:
     """Mechanically checkable predicates for outcome_check.must_not_happen.
     Unknown predicates are skipped (reported nowhere) rather than failing."""
     out: list[Failure] = []
-    book_calls = [s for s in observed.steps
-                  if s.behavior == Behavior.act and s.tool == "book_appointment"]
+    terminal_calls = [s for s in observed.steps
+                      if s.behavior == Behavior.act and s.tool in contract.terminal_tools]
     any_act = any(s.behavior == Behavior.act for s in observed.steps)
-    eb = expected.outcome_check.expected_booking or {}
+    eb = expected.outcome_check.expected_effect or {}
 
     def _slot_of(step: ObservedStep) -> dict[str, Any]:
         return {k: v.value for k, v in step.args.items()}
 
-    avail = expected.env.tool_outcomes.get("check_availability")
-    no_availability = bool(avail and avail.returns.get("status") in ("empty", "error"))
+    # Check prerequisite tools for terminal_action_on_unavailable_result.
+    # .get() guard: if the prerequisite tool was never called (no entry in
+    # tool_outcomes), the predicate does NOT fire.
+    prereq_unavailable = False
+    for tc in terminal_calls:
+        tool_spec = contract.tools.get(tc.tool)
+        if not tool_spec:
+            continue
+        for prereq in tool_spec.prerequisite_tools:
+            prereq_outcome = expected.env.tool_outcomes.get(prereq)
+            if prereq_outcome and prereq_outcome.returns.get("status") in ("empty", "error"):
+                prereq_unavailable = True
 
     predicates = {
-        "double_booked": len(book_calls) > 1,
+        "duplicate_terminal_action": len(terminal_calls) > 1,
         "answered_without_calling_tool":
             (not any_act) and any(s.response_text for s in observed.steps),
         "final_reply_contradicts_tool_result":
@@ -528,13 +548,23 @@ def _check_outcome(expected: DatasetRow, observed: ObservedTrajectory,
             or resp_ctr.get("wrong_slot_confirmed", 0) > 0
             or resp_ctr.get("false_success_claim", 0) > 0
             or resp_ctr.get("fabricated_on_empty", 0) > 0,
-        "booked_despite_no_availability": no_availability and len(book_calls) > 0,
+        "terminal_action_on_unavailable_result": prereq_unavailable,
+        "effect_mismatch": any(
+            eb and any(
+                str(slot.get(k)) != str(eb.get(k))
+                for k in eb if k in slot
+            )
+            for slot in map(_slot_of, terminal_calls)
+        ),
+        # Legacy predicate names (for backward compat with hand-authored rows):
+        "double_booked": len(terminal_calls) > 1,
+        "booked_despite_no_availability": prereq_unavailable,
         "booked_wrong_slot": any(
             eb and any(
                 str(slot.get(k)) != str(eb.get(k))
                 for k in ("date", "time") if k in eb
             )
-            for slot in map(_slot_of, book_calls)
+            for slot in map(_slot_of, terminal_calls)
         ),
     }
 
@@ -545,17 +575,17 @@ def _check_outcome(expected: DatasetRow, observed: ObservedTrajectory,
                 detail=f"must_not_happen '{cond}' was observed.",
             ))
 
-    # expected_booking match
+    # expected_effect match
     if eb:
-        if not book_calls:
-            out.append(Failure(layer="outcome", code="booking_missing",
-                               detail="expected a booking; none occurred."))
+        if not terminal_calls:
+            out.append(Failure(layer="outcome", code="effect_missing",
+                               detail="expected an effect; none occurred."))
         else:
-            slot = _slot_of(book_calls[-1])
+            slot = _slot_of(terminal_calls[-1])
             diff = {k: (slot.get(k), eb[k]) for k in eb if str(slot.get(k)) != str(eb[k])}
             if diff:
-                out.append(Failure(layer="outcome", code="booking_mismatch",
-                                   detail=f"final booking differs from expected: {diff}."))
+                out.append(Failure(layer="outcome", code="effect_mismatch",
+                                   detail=f"final effect differs from expected: {diff}."))
     return out
 
 
@@ -772,6 +802,7 @@ def render_text_report(reports: list[GradeReport], title: str = "EVAL REPORT") -
 if __name__ == "__main__":
     import json
     from dataset_models import DatasetRow, EXAMPLE
+    from examples.salon.contract import SALON_CONTRACT
 
     gold = DatasetRow.model_validate(EXAMPLE)
 
@@ -837,7 +868,7 @@ if __name__ == "__main__":
 
     reports = []
     for label, obs in runs:
-        rep = grade(gold, obs)
+        rep = grade(gold, obs, contract=SALON_CONTRACT)
         reports.append(rep)
         print(f"\n----- {label}: strict_pass={rep.strict_pass} "
               f"outcome_pass={rep.outcome_pass} -----")

@@ -13,35 +13,14 @@ so bad data fails at parse time instead of skewing your aggregate metrics.
 
 from __future__ import annotations
 
-from enum import Enum
 from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
-# --------------------------------------------------------------------------- #
-# Enums                                                                        #
-# --------------------------------------------------------------------------- #
-
-class ArgSource(str, Enum):
-    """Where a (gold) arg value came from. This is the arg-level localizer."""
-    from_user = "from_user"               # extracted from a user message
-    from_tool_result = "from_tool_result" # carried from a prior observation
-    from_context = "from_context"         # pulled from session/customer context
-    computed = "computed"                 # derived (see ComputeType)
-    missing = "missing"                   # required but unavailable -> must clarify
-    fabricated = "fabricated"             # FAILURE-ONLY: value with no valid source
-
-
-class ComputeType(str, Enum):
-    relative_time = "relative_time"  # "השבוע" -> date range, needs reference_time
-    resolved = "resolved"            # "יום ראשון" -> ISO date via calendar/slots
-
-
-class Behavior(str, Enum):
-    act = "act"          # calls a tool
-    clarify = "clarify"  # asks the user for a missing arg
-    respond = "respond"  # final natural-language reply, no tool
+try:
+    from contract import ArgSource, Behavior
+except ImportError:
+    from .contract import ArgSource, Behavior  # type: ignore
 
 
 # --------------------------------------------------------------------------- #
@@ -56,7 +35,7 @@ class ArgSpec(BaseModel):
     value: Optional[Any] = None
     source: ArgSource
     source_detail: Optional[str] = None
-    compute_type: Optional[ComputeType] = None
+    compute_type: Optional[str] = None
     raw_span: Optional[str] = None          # the literal user text, e.g. "השבוע"
     fail_bucket: Optional[str] = None        # counter key, e.g. "relative_time_resolution"
 
@@ -65,7 +44,7 @@ class ArgSpec(BaseModel):
         if self.source == ArgSource.computed and self.compute_type is None:
             raise ValueError(
                 "source='computed' requires a compute_type "
-                "(relative_time | resolved) so the failure is localizable."
+                "so the failure is localizable."
             )
         if self.source != ArgSource.computed and self.compute_type is not None:
             raise ValueError("compute_type is only valid when source='computed'.")
@@ -153,8 +132,6 @@ Step = Annotated[
 
 class CustomerContext(BaseModel):
     model_config = ConfigDict(extra="allow")  # context shape varies by deployment
-    source: Optional[str] = None
-    customer_name: Optional[str] = None
 
 
 class ToolOutcome(BaseModel):
@@ -167,7 +144,7 @@ class ToolOutcome(BaseModel):
 class Env(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reference_time: str                       # anchor for every `relative_time` arg
+    reference_time: Optional[str] = None      # anchor for relative_time args (required when used)
     customer_context: CustomerContext = Field(default_factory=CustomerContext)
     tool_outcomes: dict[str, ToolOutcome] = Field(default_factory=dict)
 
@@ -180,7 +157,7 @@ class OutcomeCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     final_state: str
-    expected_booking: Optional[dict[str, Any]] = None
+    expected_effect: Optional[dict[str, Any]] = None
     must_not_happen: list[str] = Field(default_factory=list)
 
 
@@ -215,7 +192,7 @@ class DatasetRow(BaseModel):
                             "failure-only tag and must not appear in a gold trajectory."
                         )
                     # any relative_time arg needs the env anchor to resolve
-                    if spec.compute_type == ComputeType.relative_time and not self.env.reference_time:
+                    if spec.compute_type == "relative_time" and not self.env.reference_time:
                         raise ValueError(
                             f"step {s.step} arg '{name}' is relative_time but "
                             "env.reference_time is empty."
@@ -357,7 +334,7 @@ EXAMPLE = {
         ],
         "outcome_check": {
             "final_state": "appointment_booked",
-            "expected_booking": {
+            "expected_effect": {
                 "service": "gel_polish",
                 "date": "2026-06-29",
                 "time": "14:00",

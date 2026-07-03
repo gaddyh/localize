@@ -1,0 +1,14 @@
+───────────────────────────────────────────────────────────────── Grader validation (140 runs) ──────────────────────────────────────────────────────────────────
+           Grader validation: injected vs measured (140 runs, 99% CI)           
+                                                                                
+   injected knob    rate   denom   expected         99% CI   measured   result  
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
+  premature_stop   0.080     140       11.2    [2.9, 19.5]         11     PASS  
+      wrong_tool   0.150     140       21.0   [10.1, 31.9]         21     PASS  
+       eager_act   0.250      40       10.0    [2.9, 17.1]         12     PASS  
+  arg_resolution   0.170     140       23.8   [12.4, 35.2]         26     PASS  
+   false_success   0.400      37       14.7    [7.1, 22.4]         12     PASS  
+                                                                                
+  5/5 knobs within tolerance -> grader is faithful
+
+injected agent profile: {'eager_act': 0.25, 'wrong_tool': 0.15, 'arg_resolution': 0.2, 'omit_fact': 0.15, 'false_success': 0.4, 'premature_stop': 0.08}

@@ -1,21 +1,16 @@
 """
-LLM-as-judge for the response layer.
+LLM-as-judge for the response layer (contract-driven).
 
 An `LLMResponseJudge` has the SAME signature as `heuristic_response_judge`
 (ResponseContext -> list[Finding]), so it drops into `grade(...)` unchanged:
 
     from judges import LLMResponseJudge
-    judge = LLMResponseJudge()                      # real Anthropic backend
-    report = grade(gold, observed, response_judge=judge)
+    judge = LLMResponseJudge(contract=my_contract)
+    report = grade(gold, observed, contract=my_contract, response_judge=judge)
 
-Why a judge at all? The heuristic checks SUBSTRINGS. It can't tell that
-"קבעתי לך תור" ("I booked you a slot") is a false success claim unless that exact
-phrase is in must_not_contain. An LLM reads meaning: it catches paraphrased
-hallucinations, soft success claims, and wrong-language replies the substring
-rules miss.
-
-The backend is injectable (like the agent simulator):
-  * default        -> real Anthropic API (needs ANTHROPIC_API_KEY)
+The system prompt is now driven by `contract.role_description` instead of
+a hardcoded salon string.  The backend is injectable (like the agent simulator):
+  * default        -> real OpenAI API (needs OPENAI_API_KEY)
   * complete_fn=... -> any callable(prompt:str)->str, for offline tests/demos
 
 Output is constrained to the SHARED bucket vocabulary so the report and the
@@ -28,6 +23,7 @@ import json
 from typing import Callable, Optional
 
 from grading import Finding, ResponseContext
+from contract import Contract
 
 from dotenv import load_dotenv
 
@@ -56,16 +52,17 @@ BUCKET_GLOSSARY = """\
 - forbidden_phrase: a MUST_NOT_CONTAIN phrase appears with no more specific tag.
 """
 
-SYSTEM_PROMPT = (
-    "You are a strict evaluator for a WhatsApp salon-booking agent. You grade ONE "
-    "agent reply against a rubric and the tool result the agent saw. You judge only "
-    "the reply text; you do not re-do the agent's job. Report only failures that are "
-    "clearly supported. Reply with JSON only, no prose."
-)
 
+def build_prompt(ctx: ResponseContext, contract: Optional[Contract] = None) -> str:
+    role = contract.role_description if contract else (
+        "You are a strict evaluator for an agent. You grade ONE agent reply "
+        "against a rubric and the tool result the agent saw. You judge only "
+        "the reply text; you do not re-do the agent's job. Report only failures "
+        "that are clearly supported. Reply with JSON only, no prose."
+    )
+    return f"""{role}
 
-def build_prompt(ctx: ResponseContext) -> str:
-    return f"""Grade this agent reply.
+Grade this agent reply.
 
 EXPECTED LANGUAGE: {ctx.language}
 INTENDED REPLY TYPE (speech_act): {ctx.speech_act}
@@ -112,14 +109,17 @@ class LLMResponseJudge:
 
     Parameters
     ----------
-    model : Anthropic model id (ignored when complete_fn is given).
+    contract : the domain Contract (provides role_description for the system prompt).
+    model : OpenAI model id (ignored when complete_fn is given).
     complete_fn : optional callable(prompt:str)->str. If provided, it REPLACES the
-        Anthropic call -- used for offline tests/demos. If omitted, a real Anthropic
-        client is created lazily (requires ANTHROPIC_API_KEY).
+        API call -- used for offline tests/demos. If omitted, a real OpenAI
+        client is created lazily (requires OPENAI_API_KEY).
     """
 
-    def __init__(self, model: str = "gpt-4o",
+    def __init__(self, contract: Optional[Contract] = None,
+                 model: str = "gpt-4o",
                  complete_fn: Optional[Callable[[str], str]] = None):
+        self.contract = contract
         self.model = model
         self._complete = complete_fn
         self._client = None
@@ -131,7 +131,8 @@ class LLMResponseJudge:
         msg = self._client.chat.completions.create(
             model=self.model, max_tokens=512,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self.contract.role_description
+                 if self.contract else "You are a strict evaluator."},
                 {"role": "user",   "content": prompt},
             ],
         )
@@ -142,14 +143,14 @@ class LLMResponseJudge:
         if ctx.text is None or not ctx.text.strip():
             return [Finding(bucket="no_response_text",
                             detail="gold expects a reply but agent produced no text.")]
-        prompt = build_prompt(ctx)
+        prompt = build_prompt(ctx, self.contract)
         raw = (self._complete or self._complete_via_api)(prompt)
         return _parse(raw)
 
 
 # --------------------------------------------------------------------------- #
 # Offline scripted backend: a stand-in "judge model" for demos without a key.  #
-# It reasons over ctx (not substrings) to show the judge INTERFACE end-to-end:  #
+# It reasons over ctx (not substrings) to show the judge INTERFACE end-to-end: #
 # it understands meaning we deliberately phrase to dodge the substring rules.   #
 # --------------------------------------------------------------------------- #
 
@@ -176,13 +177,14 @@ def scripted_backend(prompt: str) -> str:
     return json.dumps({"findings": findings}, ensure_ascii=False)
 
 
-def default_judge(model: str = "gpt-4o") -> "LLMResponseJudge":
+def default_judge(model: str = "gpt-4o",
+                  contract: Optional[Contract] = None) -> "LLMResponseJudge":
     """Real OpenAI backend if OPENAI_API_KEY is set, else the offline
     scripted backend so demos/CI run without a key."""
     import os
     if os.environ.get("OPENAI_API_KEY"):
-        return LLMResponseJudge(model=model)
-    return LLMResponseJudge(model=model, complete_fn=scripted_backend)
+        return LLMResponseJudge(contract=contract, model=model)
+    return LLMResponseJudge(contract=contract, model=model, complete_fn=scripted_backend)
 
 
 if __name__ == "__main__":

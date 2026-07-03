@@ -1,18 +1,15 @@
 """
-Volume generator for the booking-agent eval.
+Volume generator for the booking-agent eval (contract-driven).
 
 Two pieces:
-  make_gold(scenario, status, params)  -> a gold DatasetRow
-  simulate_agent(gold, profile, rng)   -> an ObservedTrajectory whose errors are
-                                          injected at tunable per-failure-mode rates
+  make_gold(scenario, idx, rng, contract, fixtures)  -> a gold DatasetRow
+  simulate_agent(gold, profile, rng, contract)       -> an ObservedTrajectory
 
-build_dataset(n_per_cell, profile, seed) crosses every (scenario, status) cell
-n_per_cell times, so you get controlled volume. Because the agent's mistakes are
-sampled from `profile`, the measured failure-bucket rates should track the
-injected rates -- which is how you sanity-check that the GRADER itself is faithful.
+build_dataset(n_per_cell, profile, seed, contract, fixtures) crosses every
+(scenario, status) cell n_per_cell times, so you get controlled volume.
 
-Scenarios:  check_ok, check_empty, book_ok, book_error,
-            cancel_ok, check_service_missing, book_time_missing
+The scenario grid is derived from the Contract's tools and their
+applicable_statuses — no hardcoded scenario names.
 """
 
 from __future__ import annotations
@@ -21,20 +18,9 @@ import math
 import random
 from typing import Optional
 
+from contract import Contract, ArgSource
 from dataset_models import DatasetRow
 from grading import ObservedTrajectory
-
-REF = "2026-06-27T09:00:00+03:00"
-CUST_NAMES = ["דנה כהן", "מאיה לוי", "נועה ברק", "רוני אבני", "תמר שגב"]
-SERVICES = {"gel_polish": "לק ג׳ל", "manicure": "מניקור", "pedicure": "פדיקור"}
-DAYS = {  # day-name -> (hebrew, iso)  (synthetic calendar, kept internally consistent)
-    "sunday": ("יום ראשון", "2026-06-29"),
-    "monday": ("יום שני", "2026-06-30"),
-    "tuesday": ("יום שלישי", "2026-07-01"),
-    "wednesday": ("יום רביעי", "2026-07-02"),
-}
-TIMES = ["09:30", "11:00", "14:00", "16:30"]
-WEEK_RANGE = "2026-06-29..2026-07-04"
 
 
 def _arg(value, source, fail_bucket=None, **kw):
@@ -46,253 +32,335 @@ def _arg(value, source, fail_bucket=None, **kw):
 
 
 # --------------------------------------------------------------------------- #
+# Scenario grid: derived from contract + fixtures                              #
+# --------------------------------------------------------------------------- #
+
+def generate_scenario_grid(contract: Contract, fixtures: dict) -> list[dict]:
+    """Derive all (tool, status) cells from the contract.
+
+    For each tool, each applicable_status produces a scenario cell.
+    Additionally, for each tool, each required arg with provenance_hint
+    != "from_context" produces a clarify-then-act cell (the arg is missing).
+
+    Excludes from_context args from clarify rungs (Catch 2a: those are
+    pulled from session context, not from the user, so the agent should
+    never clarify them).
+
+    Returns a list of scenario dicts with keys:
+        tool, status, missing_arg (optional)
+    """
+    cells: list[dict] = []
+
+    for tool_name, tool_spec in contract.tools.items():
+        for status in tool_spec.applicable_statuses:
+            # direct call with all args present
+            cells.append({"tool": tool_name, "status": status})
+
+            # clarify-then-act for each required arg that is NOT from_context
+            for arg_name, arg_spec in tool_spec.args.items():
+                if not arg_spec.required:
+                    continue
+                if arg_spec.provenance_hint == "from_context":
+                    continue
+                cells.append({
+                    "tool": tool_name,
+                    "status": status,
+                    "missing_arg": arg_name,
+                })
+
+    return cells
+
+
+# --------------------------------------------------------------------------- #
 # Gold construction                                                            #
 # --------------------------------------------------------------------------- #
 
-def make_gold(scenario: str, idx: int, rng: random.Random) -> DatasetRow:
-    svc_key = rng.choice(list(SERVICES))
-    svc_he = SERVICES[svc_key]
-    name = rng.choice(CUST_NAMES)
-    day_key = rng.choice(list(DAYS))
-    day_he, day_iso = DAYS[day_key]
-    t = rng.choice(TIMES)
-    env_cust = {"source": "whatsapp", "customer_name": name}
-    base_id = f"{scenario}__{idx:03d}"
+def make_gold(scenario: dict, idx: int, rng: random.Random,
+              contract: Contract, fixtures: dict) -> DatasetRow:
+    """Build a gold DatasetRow from a scenario dict produced by
+    generate_scenario_grid().  No hardcoded scenario names — fully driven
+    by contract + fixtures."""
+    tool_name = scenario["tool"]
+    status = scenario["status"]
+    missing_arg = scenario.get("missing_arg")
+    tool_spec = contract.tools[tool_name]
 
-    def env(tool, returns):
-        return {"reference_time": REF, "customer_context": env_cust,
-                "tool_outcomes": {tool: {"returns": returns}}}
+    # Pick fixture values
+    services = fixtures.get("services", {})
+    svc_key = rng.choice(list(services)) if services else None
+    svc_he = services.get(svc_key, "")
+    names = fixtures.get("customer_names", [""])
+    name = rng.choice(names)
+    days = fixtures.get("days", {})
+    day_key = rng.choice(list(days)) if days else None
+    day_he, day_iso = days.get(day_key, ("", ""))
+    times = fixtures.get("times", [""])
+    t = rng.choice(times)
+    week_range = fixtures.get("week_range", "")
+    ref = fixtures.get("reference_time", "")
+    ctx_source = fixtures.get("context_source", "whatsapp")
+    env_cust = {"source": ctx_source, "customer_name": name}
+    base_id = f"{tool_name}__{status}"
+    if missing_arg:
+        base_id += f"__missing_{missing_arg}"
+    base_id += f"__{idx:03d}"
 
-    if scenario == "check_ok":
-        return DatasetRow.model_validate({
-            "id": base_id, "intent": "availability_check", "turn_pattern": "lookup",
-            "env": env("check_availability",
-                       {"status": "ok", "slots": [{"date": day_iso, "time": t}]}),
-            "expected_trajectory": [
-                {"step": 1, "behavior": "act",
-                 "user_message": f"יש {svc_he} השבוע?", "tool": "check_availability",
-                 "args": {"service": _arg(svc_key, "from_user", "service_extraction"),
-                          "date_range": _arg(WEEK_RANGE, "computed", "relative_time_resolution",
-                                             compute_type="relative_time", raw_span="השבוע")},
-                 "forbidden": {"tools": ["book_appointment"], "args": ["date", "time"],
-                               "reason": "availability only"}},
-                {"step": 2, "behavior": "respond", "reacts_to": "observation_from_step_1",
-                 "response_check": {"speech_act": "report_availability", "language": "he",
-                                    "must_reflect": [f"{day_iso} {t}"],
-                                    "screens_for": ["omitted_slot"]}},
-            ],
-            "outcome_check": {"final_state": "slots_reported_to_user",
-                              "must_not_happen": ["appointment_booked"]},
-        })
+    # Build tool outcome
+    if tool_name == "check_availability":
+        if status == "ok":
+            returns = {"status": "ok", "slots": [{"date": day_iso, "time": t}]}
+        elif status == "empty":
+            returns = {"status": "empty", "slots": []}
+        else:
+            returns = {"status": status}
+    elif tool_name == "book_appointment":
+        if status == "ok":
+            cid = f"BK-{7000 + idx}"
+            returns = {"status": "ok", "confirmation_id": cid}
+        elif status == "error":
+            returns = {"status": "error", "reason": "slot_taken"}
+        else:
+            returns = {"status": status}
+    elif tool_name == "cancel_appointment":
+        if status == "ok":
+            returns = {"status": "ok", "cancelled": {"date": day_iso, "time": t}}
+        else:
+            returns = {"status": status}
+    else:
+        returns = {"status": status}
 
-    if scenario == "check_empty":
-        return DatasetRow.model_validate({
-            "id": base_id, "intent": "availability_check", "turn_pattern": "lookup_empty",
-            "env": env("check_availability", {"status": "empty", "slots": []}),
-            "expected_trajectory": [
-                {"step": 1, "behavior": "act",
-                 "user_message": f"יש {svc_he} השבוע?", "tool": "check_availability",
-                 "args": {"service": _arg(svc_key, "from_user", "service_extraction"),
-                          "date_range": _arg(WEEK_RANGE, "computed", "relative_time_resolution",
-                                             compute_type="relative_time", raw_span="השבוע")},
-                 "forbidden": {"tools": ["book_appointment"],
-                               "reason": "availability only"}},
-                {"step": 2, "behavior": "respond", "reacts_to": "observation_from_step_1",
-                 "response_check": {"speech_act": "report_no_availability", "language": "he",
-                                    "expected_status": "empty",
-                                    "screens_for": ["fabricated_on_empty"]}},
-            ],
-            "outcome_check": {"final_state": "no_availability_reported",
-                              "must_not_happen": ["appointment_booked",
-                                                  "booked_despite_no_availability",
-                                                  "final_reply_contradicts_tool_result"]},
-        })
+    env_dict = {
+        "reference_time": ref,
+        "customer_context": env_cust,
+        "tool_outcomes": {tool_name: {"returns": returns}},
+    }
 
-    if scenario == "book_ok":
-        cid = f"BK-{7000 + idx}"
-        return DatasetRow.model_validate({
-            "id": base_id, "intent": "book", "turn_pattern": "single_turn_book",
-            "env": env("book_appointment", {"status": "ok", "confirmation_id": cid}),
-            "expected_trajectory": [
-                {"step": 1, "behavior": "act",
-                 "user_message": f"תקבעי לי {svc_he} ל{day_he} ב-{t}", "tool": "book_appointment",
-                 "args": {"service": _arg(svc_key, "from_user", "service_extraction"),
-                          "date": _arg(day_iso, "computed", "day_name_resolution",
-                                       compute_type="resolved", raw_span=day_he),
-                          "time": _arg(t, "from_user"),
-                          "customer_name": _arg(name, "from_context", "context_lookup")},
-                 "forbidden": {"tools": ["check_availability"], "behaviors": ["clarify"],
-                               "reason": "all args present"}},
-                {"step": 2, "behavior": "respond", "reacts_to": "observation_from_step_1",
-                 "response_check": {"speech_act": "confirm_booking", "language": "he",
-                                    "must_reflect": [cid, day_iso, t],
-                                    "screens_for": ["omitted_confirmation_id"]}},
-            ],
-            "outcome_check": {"final_state": "appointment_booked",
-                              "expected_booking": {"service": svc_key, "date": day_iso, "time": t},
-                              "must_not_happen": ["double_booked"]},
-        })
+    # Build args dict from contract spec
+    def build_args(exclude: Optional[str] = None) -> dict:
+        args = {}
+        for arg_name, arg_spec in tool_spec.args.items():
+            if arg_name == exclude:
+                continue
+            if arg_name == "service":
+                args["service"] = _arg(svc_key, "from_user", arg_spec.fail_bucket,
+                                       source_detail=f"'{svc_he}'")
+            elif arg_name == "date_range":
+                args["date_range"] = _arg(week_range, "computed", arg_spec.fail_bucket,
+                                          compute_type=arg_spec.compute_type_hint,
+                                          raw_span="השבוע")
+            elif arg_name == "date":
+                args["date"] = _arg(day_iso, "computed", arg_spec.fail_bucket,
+                                    compute_type=arg_spec.compute_type_hint,
+                                    raw_span=day_he)
+            elif arg_name == "time":
+                args["time"] = _arg(t, "from_user")
+            elif arg_name == "customer_name":
+                args["customer_name"] = _arg(name, "from_context", arg_spec.fail_bucket,
+                                             source_detail="env.customer_context")
+            else:
+                args[arg_name] = _arg(None, arg_spec.provenance_hint or "from_user",
+                                      arg_spec.fail_bucket)
+        return args
 
-    if scenario == "book_error":
-        return DatasetRow.model_validate({
-            "id": base_id, "intent": "book", "turn_pattern": "book_fails",
-            "env": env("book_appointment", {"status": "error", "reason": "slot_taken"}),
-            "expected_trajectory": [
-                {"step": 1, "behavior": "act",
-                 "user_message": f"תקבעי לי {svc_he} ל{day_he} ב-{t}", "tool": "book_appointment",
-                 "args": {"service": _arg(svc_key, "from_user", "service_extraction"),
-                          "date": _arg(day_iso, "computed", "day_name_resolution",
-                                       compute_type="resolved", raw_span=day_he),
-                          "time": _arg(t, "from_user"),
-                          "customer_name": _arg(name, "from_context", "context_lookup")},
-                 "forbidden": {"tools": ["check_availability"],
-                               "reason": "all args present"}},
-                {"step": 2, "behavior": "respond", "reacts_to": "observation_from_step_1",
-                 "response_check": {"speech_act": "report_booking_failed", "language": "he",
-                                    "expected_status": "error",
-                                    "screens_for": ["false_success_claim"]}},
-            ],
-            "outcome_check": {"final_state": "booking_failed_reported",
-                              "must_not_happen": ["final_reply_contradicts_tool_result"]},
-        })
+    # Build forbidden tools: all tools except the current one
+    other_tools = [t for t in contract.tools if t != tool_name]
 
-    if scenario == "cancel_ok":
-        return DatasetRow.model_validate({
-            "id": base_id, "intent": "cancel", "turn_pattern": "single_turn_cancel",
-            "env": env("cancel_appointment",
-                       {"status": "ok", "cancelled": {"date": day_iso, "time": t}}),
-            "expected_trajectory": [
-                {"step": 1, "behavior": "act",
-                 "user_message": f"תבטלי את התור של {day_he} ב-{t}", "tool": "cancel_appointment",
-                 "args": {"date": _arg(day_iso, "computed", "day_name_resolution",
-                                       compute_type="resolved", raw_span=day_he),
-                          "time": _arg(t, "from_user")},
-                 "forbidden": {"tools": ["book_appointment", "check_availability"],
-                               "args": ["service"], "reason": "cancellation, not booking"}},
-                {"step": 2, "behavior": "respond", "reacts_to": "observation_from_step_1",
-                 "response_check": {"speech_act": "confirm_cancellation", "language": "he",
-                                    "must_reflect": [day_iso, t],
-                                    "must_not_contain": ["BK-"],
-                                    "screens_for": ["wrong_slot_confirmed"]}},
-            ],
-            "outcome_check": {"final_state": "appointment_cancelled",
-                              "must_not_happen": ["double_booked"]},
-        })
+    # Determine speech_act and response_check based on tool + status
+    if tool_name == "check_availability":
+        if status == "empty":
+            speech_act = "report_no_availability"
+            expected_status = "empty"
+            screens_for = ["fabricated_on_empty"]
+        else:
+            speech_act = "report_availability"
+            expected_status = None
+            screens_for = ["omitted_slot"]
+        must_reflect = [f"{day_iso} {t}"] if status == "ok" else []
+        resp_check = {
+            "speech_act": speech_act, "language": contract.language,
+            "screens_for": screens_for,
+        }
+        if expected_status:
+            resp_check["expected_status"] = expected_status
+        if must_reflect:
+            resp_check["must_reflect"] = must_reflect
+        final_state = "slots_reported_to_user" if status == "ok" else "no_availability_reported"
+        must_not_happen = ["appointment_booked"]
+        if status == "empty":
+            must_not_happen += ["booked_despite_no_availability",
+                                "final_reply_contradicts_tool_result"]
+        expected_effect = None
+    elif tool_name == "book_appointment":
+        if status == "error":
+            speech_act = "report_booking_failed"
+            expected_status = "error"
+            screens_for = ["false_success_claim"]
+            must_reflect = []
+        else:
+            speech_act = "confirm_booking"
+            expected_status = None
+            screens_for = ["omitted_confirmation_id"]
+            must_reflect = [returns.get("confirmation_id", ""), day_iso, t]
+        resp_check = {
+            "speech_act": speech_act, "language": contract.language,
+            "screens_for": screens_for,
+        }
+        if expected_status:
+            resp_check["expected_status"] = expected_status
+        if must_reflect:
+            resp_check["must_reflect"] = must_reflect
+        final_state = "appointment_booked" if status == "ok" else "booking_failed_reported"
+        must_not_happen = ["double_booked"] if status == "ok" else ["final_reply_contradicts_tool_result"]
+        expected_effect = {"service": svc_key, "date": day_iso, "time": t} if status == "ok" else None
+    elif tool_name == "cancel_appointment":
+        speech_act = "confirm_cancellation"
+        resp_check = {
+            "speech_act": speech_act, "language": contract.language,
+            "must_reflect": [day_iso, t],
+            "must_not_contain": ["BK-"],
+            "screens_for": ["wrong_slot_confirmed"],
+        }
+        final_state = "appointment_cancelled"
+        must_not_happen = ["double_booked"]
+        expected_effect = None
+    else:
+        speech_act = "report_result"
+        resp_check = {"speech_act": speech_act, "language": contract.language}
+        final_state = "completed"
+        must_not_happen = []
+        expected_effect = None
 
-    if scenario == "check_service_missing":
-        return DatasetRow.model_validate({
-            "id": base_id, "intent": "availability_check", "turn_pattern": "clarify_then_lookup",
-            "env": env("check_availability",
-                       {"status": "ok", "slots": [{"date": day_iso, "time": t}]}),
-            "expected_trajectory": [
-                {"step": 1, "behavior": "clarify",
-                 "user_message": "יש לכם מקום השבוע?", "clarify_target": "service",
-                 "response_check": {"speech_act": "ask_service", "language": "he",
-                                    "must_not_contain": ["BK-", "נקבע"]},
-                 "forbidden": {"tools": ["check_availability", "book_appointment"],
-                               "args": ["service"], "reason": "service unknown"}},
-                {"step": 2, "behavior": "act",
-                 "user_message": svc_he, "tool": "check_availability",
-                 "args": {"service": _arg(svc_key, "from_user", "service_extraction"),
-                          "date_range": _arg(WEEK_RANGE, "computed", "relative_time_resolution",
-                                             compute_type="relative_time", raw_span="השבוע")},
-                 "forbidden": {"tools": ["book_appointment"], "reason": "look up"}},
-                {"step": 3, "behavior": "respond", "reacts_to": "observation_from_step_2",
-                 "response_check": {"speech_act": "report_availability", "language": "he",
-                                    "must_reflect": [f"{day_iso} {t}"],
-                                    "screens_for": ["omitted_slot"]}},
-            ],
-            "outcome_check": {"final_state": "slots_reported_to_user",
-                              "must_not_happen": ["appointment_booked"]},
-        })
+    # Build trajectory
+    if missing_arg is None:
+        trajectory = [
+            {"step": 1, "behavior": "act",
+             "user_message": f"יש {svc_he} השבוע?" if tool_name == "check_availability"
+                             else f"תקבעי לי {svc_he} ל{day_he} ב-{t}" if tool_name == "book_appointment"
+                             else f"תבטלי את התור של {day_he} ב-{t}",
+             "tool": tool_name,
+             "args": build_args(),
+             "forbidden": {"tools": other_tools, "reason": "wrong tool"}},
+            {"step": 2, "behavior": "respond", "reacts_to": "observation_from_step_1",
+             "response_check": resp_check},
+        ]
+    else:
+        clarify_speech_act = f"ask_{missing_arg}"
+        trajectory = [
+            {"step": 1, "behavior": "clarify",
+             "user_message": f"יש לכם מקום השבוע?" if missing_arg == "service"
+                             else f"תקבעי לי {svc_he} ל{day_he}" if missing_arg == "time"
+                             else f"יש {svc_he} השבוע?",
+             "clarify_target": missing_arg,
+             "response_check": {"speech_act": clarify_speech_act,
+                                "language": contract.language,
+                                "must_not_contain": ["BK-", "נקבע"]},
+             "forbidden": {"tools": [tool_name] + other_tools,
+                           "args": [missing_arg],
+                           "reason": f"{missing_arg} unknown"}},
+            {"step": 2, "behavior": "act",
+             "user_message": svc_he if missing_arg == "service"
+                             else f"ב-{t}" if missing_arg == "time"
+                             else "השבוע",
+             "tool": tool_name,
+             "args": build_args(),
+             "forbidden": {"tools": other_tools, "reason": "now act"}},
+            {"step": 3, "behavior": "respond", "reacts_to": "observation_from_step_2",
+             "response_check": resp_check},
+        ]
 
-    if scenario == "book_time_missing":
-        cid = f"BK-{7500 + idx}"
-        return DatasetRow.model_validate({
-            "id": base_id, "intent": "book", "turn_pattern": "clarify_then_book",
-            "env": env("book_appointment", {"status": "ok", "confirmation_id": cid}),
-            "expected_trajectory": [
-                {"step": 1, "behavior": "clarify",
-                 "user_message": f"תקבעי לי {svc_he} ל{day_he}", "clarify_target": "time",
-                 "response_check": {"speech_act": "ask_time", "language": "he",
-                                    "must_not_contain": ["BK-", "נקבע"]},
-                 "forbidden": {"tools": ["book_appointment"], "args": ["time"],
-                               "reason": "time unknown"}},
-                {"step": 2, "behavior": "act",
-                 "user_message": f"ב-{t}", "tool": "book_appointment",
-                 "args": {"service": _arg(svc_key, "from_user", "service_extraction"),
-                          "date": _arg(day_iso, "computed", "day_name_resolution",
-                                       compute_type="resolved", raw_span=day_he),
-                          "time": _arg(t, "from_user"),
-                          "customer_name": _arg(name, "from_context", "context_lookup")},
-                 "forbidden": {"tools": ["check_availability"], "reason": "now book"}},
-                {"step": 3, "behavior": "respond", "reacts_to": "observation_from_step_2",
-                 "response_check": {"speech_act": "confirm_booking", "language": "he",
-                                    "must_reflect": [cid, day_iso, t],
-                                    "screens_for": ["omitted_confirmation_id"]}},
-            ],
-            "outcome_check": {"final_state": "appointment_booked",
-                              "expected_booking": {"service": svc_key, "date": day_iso, "time": t},
-                              "must_not_happen": ["double_booked",
-                                                  "clarified_name_already_in_context"]},
-        })
+    outcome_check = {
+        "final_state": final_state,
+        "must_not_happen": must_not_happen,
+    }
+    if expected_effect:
+        outcome_check["expected_effect"] = expected_effect
 
-    raise ValueError(f"unknown scenario {scenario}")
+    row = DatasetRow.model_validate({
+        "id": base_id,
+        "intent": "availability_check" if tool_name == "check_availability"
+                  else "book" if tool_name == "book_appointment"
+                  else "cancel",
+        "turn_pattern": "clarify_then_act" if missing_arg else "single_turn",
+        "env": env_dict,
+        "expected_trajectory": trajectory,
+        "outcome_check": outcome_check,
+    })
 
+    # Catch 1: assert clarify trajectory shape for generated rows
+    if missing_arg is not None:
+        assert len(row.expected_trajectory) == 3, (
+            f"clarify row {row.id} must have 3 steps, got {len(row.expected_trajectory)}"
+        )
+        assert row.expected_trajectory[0].behavior.value == "clarify"
+        assert row.expected_trajectory[1].behavior.value == "act"
+        assert row.expected_trajectory[2].behavior.value == "respond"
 
-SCENARIOS = ["check_ok", "check_empty", "book_ok", "book_error",
-             "cancel_ok", "check_service_missing", "book_time_missing"]
-
-DEFAULT_PROFILE = {
-    "eager_act": 0.25,        # clarify step -> acts instead
-    "wrong_tool": 0.15,       # act step -> calls the wrong tool
-    "arg_resolution": 0.20,   # corrupt a computed (date/range) arg
-    "omit_fact": 0.15,        # respond -> drop a required fact
-    "false_success": 0.40,    # non-ok respond -> claims success anyway
-    "premature_stop": 0.08,   # truncate before the final reply
-}
+    return row
 
 
 # --------------------------------------------------------------------------- #
 # Agent simulator                                                             #
 # --------------------------------------------------------------------------- #
 
+DEFAULT_PROFILE = {
+    "eager_act": 0.25,
+    "wrong_tool": 0.15,
+    "arg_resolution": 0.20,
+    "omit_fact": 0.15,
+    "false_success": 0.40,
+    "premature_stop": 0.08,
+}
+
+
 def _gold_args(act_step) -> dict:
     return {k: v.value for k, v in act_step.args.items()}
 
 
-def _wrong_tool_for(tool: str, rng: random.Random) -> str:
-    alts = [t for t in ("check_availability", "book_appointment", "cancel_appointment")
-            if t != tool]
-    return rng.choice(alts)
+def _wrong_tool_for(tool: str, contract: Contract, rng: random.Random) -> str:
+    alts = [t for t in contract.tools if t != tool]
+    return rng.choice(alts) if alts else tool
 
 
-def _corrupt_date(value: str, rng: random.Random) -> str:
-    # shift a date or a range by a week -> a resolution-style error
+def _corrupt_value(value: str, rng: random.Random) -> str:
     if ".." in value:
         return "2026-07-06..2026-07-11"
-    return rng.choice([iso for _, iso in DAYS.values() if iso != value] or [value])
+    if len(value) == 10 and value[4] == "-":
+        return "2026-07-06"
+    return value + "x"
 
 
-def simulate_agent(gold: DatasetRow, profile: dict, rng: random.Random) -> ObservedTrajectory:
+def simulate_agent(gold: DatasetRow, profile: dict, rng: random.Random,
+                   contract: Contract) -> ObservedTrajectory:
     steps = []
-    derailed_book = False  # agent booked eagerly -> may carry into later steps
     for st in gold.expected_trajectory:
-        # premature stop before a final respond
         if st.behavior.value == "respond" and rng.random() < profile.get("premature_stop", 0):
             break
 
         if st.behavior.value == "clarify":
             if rng.random() < profile.get("eager_act", 0):
-                # eager-act: skip the question and act (guessing/ fabricating the missing arg)
-                # pick the tool implied by the row's intent
-                tool = "book_appointment" if "book" in gold.intent else "check_availability"
-                args = {"service": "manicure", "date_range": WEEK_RANGE} \
-                    if tool == "check_availability" else \
-                    {"service": "manicure", "date": "2026-06-30", "time": "09:00",
-                     "customer_name": "דנה כהן"}
-                steps.append({"step": st.step, "behavior": "act", "tool": tool, "args": args,
-                              "response_text": None})
+                intent = gold.intent
+                if "book" in intent:
+                    tool = "book_appointment"
+                elif "cancel" in intent:
+                    tool = "cancel_appointment"
+                else:
+                    tool = "check_availability"
+
+                tool_spec = contract.tools.get(tool)
+                args = {}
+                if tool_spec:
+                    for arg_name, arg_spec in tool_spec.args.items():
+                        if arg_spec.provenance_hint == "from_user":
+                            args[arg_name] = "manicure" if arg_name == "service" else "09:00"
+                        elif arg_spec.provenance_hint == "from_context":
+                            args[arg_name] = "דנה כהן"
+                        elif arg_spec.compute_type_hint:
+                            args[arg_name] = "2026-06-30"
+                        else:
+                            args[arg_name] = "unknown"
+
+                steps.append({"step": st.step, "behavior": "act", "tool": tool,
+                              "args": args, "response_text": None})
             else:
                 steps.append({"step": st.step, "behavior": "clarify",
                               "response_text": "אפשר פרט נוסף?"})
@@ -302,23 +370,22 @@ def simulate_agent(gold: DatasetRow, profile: dict, rng: random.Random) -> Obser
             tool = st.tool
             args = _gold_args(st)
             if rng.random() < profile.get("wrong_tool", 0):
-                tool = _wrong_tool_for(tool, rng)
+                tool = _wrong_tool_for(tool, contract, rng)
             elif rng.random() < profile.get("arg_resolution", 0):
-                for key in ("date", "date_range"):
-                    if key in args:
-                        args[key] = _corrupt_date(args[key], rng)
+                # Catch 2a: only corrupt computed args (compute_type is set)
+                for key, spec in st.args.items():
+                    if spec.compute_type is not None and key in args:
+                        args[key] = _corrupt_value(str(args[key]), rng)
                         break
-            if tool == "book_appointment":
-                derailed_book = True
-            steps.append({"step": st.step, "behavior": "act", "tool": tool, "args": args,
-                          "response_text": None})
+            steps.append({"step": st.step, "behavior": "act", "tool": tool,
+                          "args": args, "response_text": None})
             continue
 
         # respond
         rc = st.response_check
         if rc.expected_status in ("empty", "error"):
             if rng.random() < profile.get("false_success", 0):
-                text = "מצוין! קבעתי לך תור. אישור BK-9999."   # claims success after failure
+                text = "מצוין! קבעתי לך תור. אישור BK-9999."
             else:
                 text = ("מצטערת, אין מקום פנוי השבוע." if rc.expected_status == "empty"
                         else "מצטערת, ההזמנה נכשלה — התור נתפס.")
@@ -336,21 +403,38 @@ def simulate_agent(gold: DatasetRow, profile: dict, rng: random.Random) -> Obser
 
 
 def build_dataset(n_per_cell: int = 6, profile: Optional[dict] = None,
-                  seed: int = 7):
+                  seed: int = 7, contract: Optional[Contract] = None,
+                  fixtures: Optional[dict] = None):
     """Returns (cases, profile). cases = list of (label, gold, observed)."""
+    if contract is None:
+        from examples.salon.contract import SALON_CONTRACT, FIXTURES
+        contract = SALON_CONTRACT
+        fixtures = fixtures or FIXTURES
+    if fixtures is None:
+        from examples.salon.contract import FIXTURES
+        fixtures = FIXTURES
+
     profile = {**DEFAULT_PROFILE, **(profile or {})}
     rng = random.Random(seed)
+    grid = generate_scenario_grid(contract, fixtures)
     cases = []
-    for scenario in SCENARIOS:
+    for scenario in grid:
         for i in range(n_per_cell):
-            gold = make_gold(scenario, i, rng)
-            obs = simulate_agent(gold, profile, rng)
-            cases.append((f"{scenario}#{i}", gold, obs))
+            gold = make_gold(scenario, i, rng, contract, fixtures)
+            obs = simulate_agent(gold, profile, rng, contract)
+            label = f"{scenario['tool']}__{scenario['status']}"
+            if "missing_arg" in scenario:
+                label += f"__{scenario['missing_arg']}"
+            label += f"#{i}"
+            cases.append((label, gold, obs))
     return cases, profile
 
 
+# --------------------------------------------------------------------------- #
+# Validation: injected vs measured knobs                                       #
+# --------------------------------------------------------------------------- #
+
 def _denominators(cases) -> dict:
-    """Count how many opportunities each injected error mode had, from the gold."""
     n_rows = len(cases)
     n_act = n_clarify = n_respond = n_nonok = 0
     for _, gold, _ in cases:
@@ -368,11 +452,15 @@ def _denominators(cases) -> dict:
             "respond": n_respond, "nonok": n_nonok}
 
 
-def expected_knobs(cases, profile: dict) -> list[dict]:
+def expected_knobs(cases, profile: dict, contract: Contract) -> list[dict]:
     """For each injected knob: effective probability, denominator, expected count.
     Accounts for two simulator couplings:
       - arg_resolution is an `elif` after wrong_tool  -> p *= (1 - wrong_tool)
       - false_success fires only if premature_stop didn't pre-empt the respond step
+
+    Symmetric injected-side invariant: the structural couplings in
+    simulate_agent's control flow are encoded here so expected_knobs and
+    measured_knobs stay in sync.
     """
     d = _denominators(cases)
     wt = profile["wrong_tool"]
@@ -387,8 +475,9 @@ def expected_knobs(cases, profile: dict) -> list[dict]:
     ]
 
 
-def measured_knobs(reports) -> dict:
-    """Pull the measured count for each knob out of the grader aggregates."""
+def measured_knobs(reports, contract: Contract) -> dict:
+    """Pull the measured count for each knob out of the grader aggregates.
+    Uses contract.resolution_buckets to sum arg-resolution failures without drift."""
     from grading import aggregate, behavior_pairs
     agg = aggregate(reports)
     arg = agg["arg_fail_buckets"]
@@ -400,19 +489,19 @@ def measured_knobs(reports) -> dict:
         "premature_stop": beh.get("step_missing", 0),
         "wrong_tool": arg.get("wrong_tool", 0),
         "eager_act": eager,
-        "arg_resolution": (arg.get("relative_time_resolution", 0)
-                           + arg.get("day_name_resolution", 0)),
+        "arg_resolution": sum(arg.get(b, 0) for b in contract.resolution_buckets),
         "false_success": (resp.get("fabricated_on_empty", 0)
                           + resp.get("false_success_claim", 0)),
     }
 
 
-def validate(cases, reports, profile: dict, z: float = 2.576) -> list[dict]:
+def validate(cases, reports, profile: dict, contract: Contract,
+             z: float = 2.576) -> list[dict]:
     """Compare injected vs measured per knob. Pass if measured falls inside the
     z-sigma binomial interval around the expected count (default z=2.576 ~ 99%)."""
-    measured = measured_knobs(reports)
+    measured = measured_knobs(reports, contract)
     rows = []
-    for k in expected_knobs(cases, profile):
+    for k in expected_knobs(cases, profile, contract):
         p, denom = k["p"], k["denom"]
         exp = p * denom
         sd = math.sqrt(denom * p * (1 - p)) if denom > 0 else 0.0
@@ -428,5 +517,5 @@ def validate(cases, reports, profile: dict, z: float = 2.576) -> list[dict]:
 
 if __name__ == "__main__":
     cases, profile = build_dataset(n_per_cell=6, seed=7)
-    print(f"generated {len(cases)} runs across {len(SCENARIOS)} scenarios")
+    print(f"generated {len(cases)} runs across {len(set(l.split('#')[0] for l, _, _ in cases))} scenarios")
     print("profile:", profile)

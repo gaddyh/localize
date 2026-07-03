@@ -31,6 +31,7 @@ from grading import (
     tool_choice_pairs,
 )
 from examples_dataset import CASES
+from examples.salon.contract import SALON_CONTRACT
 
 
 def _ordered_labels(y_true, y_pred, tail=("(none)", "(no_call)")):
@@ -217,22 +218,22 @@ def main() -> None:
         judge = None
         if use_llm:
             from judges import default_judge
-            judge = default_judge()
-        cases, profile = build_dataset(n_per_cell=n, seed=7)
-        reports = [grade(gold, observed,
+            judge = default_judge(contract=SALON_CONTRACT)
+        cases, profile = build_dataset(n_per_cell=n, seed=7, contract=SALON_CONTRACT)
+        reports = [grade(gold, observed, contract=SALON_CONTRACT,
                          **({"response_judge": judge} if judge else {}))
                    for _, gold, observed in cases]
         tag = " [LLM judge]" if use_llm else ""
         if sys.argv[1] == "validate":
             console.rule(f"[bold]Grader validation ({len(cases)} runs){tag}[/bold]")
-            rows = validate(cases, reports, profile)
+            rows = validate(cases, reports, profile, contract=SALON_CONTRACT)
             render_validation(console, rows, len(cases))
             console.print(f"[dim]injected agent profile: {profile}[/dim]")
         else:
             run(reports, console, f"Generated volume ({len(cases)} runs){tag}")
             console.print(f"\n[dim]injected agent profile: {profile}[/dim]")
     else:
-        reports = [grade(gold, observed) for _, gold, observed in CASES]
+        reports = [grade(gold, observed, contract=SALON_CONTRACT) for _, gold, observed in CASES]
         run(reports, console, "Curated dataset")
 
 
