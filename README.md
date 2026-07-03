@@ -5,8 +5,10 @@ one number: *pass rate*. This one tells you **which decision broke and why** —
 behavior, wrong tool, a mis-resolved date, a hallucinated argument, or a reply that lied
 about what the tool actually returned.
 
-Built around a multi-turn **ReAct booking agent** (a WhatsApp nail-salon bot), with a
-**self-validating grader** — it proves itself correct before you trust it on a real model.
+Write a **Contract** that describes your agent's tools, arguments, and expected behaviors.
+The grader does the rest — five independent layers, zero engine code to touch. A bundled
+salon-booking example proves it works, with a **self-validating grader** that proves itself
+correct before you trust it on a real model.
 
 ---
 
@@ -32,28 +34,73 @@ for how (and the real bug it caught).
 git clone https://github.com/gaddyh/localize.git
 cd localize
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 
-python report.py              # dashboard over the curated, hand-written cases
-python report.py gen 20       # 140 generated runs — metrics that don't wobble
-python report.py validate 20  # prove the grader is faithful (injected vs measured)
+localize curated --contract examples.salon.contract:SALON_CONTRACT --cases examples.salon.dataset:CASES
+localize gen 20 --contract examples.salon.contract:SALON_CONTRACT
+localize validate 20 --contract examples.salon.contract:SALON_CONTRACT
+```
+
+Or with the bundled salon runner (same thing, less typing):
+
+```bash
+python examples/salon/run_report.py              # curated, hand-written cases
+python examples/salon/run_report.py gen 20       # 140 generated runs — metrics that don't wobble
+python examples/salon/run_report.py validate 20  # prove the grader is faithful (injected vs measured)
 ```
 
 Optional LLM-as-judge for the response layer (set an API key, else it falls back to an
 offline stand-in so everything still runs):
 
 ```bash
-python demo_llm_judge.py          # a paraphrase the heuristic misses and the judge catches
-python report.py validate 20 llm  # validate the grader WITH the LLM judge in the loop
+pip install -e ".[llm]"
+python examples/salon/demo_llm_judge.py          # a paraphrase the heuristic misses and the judge catches
+localize validate 20 --contract examples.salon.contract:SALON_CONTRACT --llm
 ```
 
-Python 3.10+. Deps: `pydantic`, `rich`, `scikit-learn`.
+Python 3.10+. Deps: `pydantic`, `rich`, `scikit-learn`, `python-dotenv` (LLM extra: `openai`, `anthropic`).
+
+---
+
+## The Contract — write one, grade any agent
+
+A `Contract` centralizes every piece of domain knowledge so the engine never hardcodes
+your vocabulary. Define your tools, their argument provenance, success markers, and
+outcome predicates. Swap the Contract → grade a different agent with zero engine changes.
+
+```python
+from localize import Contract, ToolArgSpec, ToolSpec
+
+MY_CONTRACT = Contract(
+    role_description="You are a strict evaluator for my agent...",
+    tools={
+        "search": ToolSpec(
+            args={
+                "query": ToolArgSpec(provenance_hint="from_user",
+                                     fail_bucket="query_extraction"),
+                "filters": ToolArgSpec(provenance_hint="computed",
+                                       compute_type_hint="relative",
+                                       fail_bucket="filter_resolution"),
+            },
+        ),
+    },
+    terminal_tools=["search"],
+    success_lexicon=["found", "matched"],
+    success_fields=["status"],
+    language="en",
+    outcome_predicates=["returned_wrong_results"],
+)
+```
+
+The bundled example — `examples/salon/contract.py` — is a full working Contract for a
+WhatsApp nail-salon booking agent with three tools, Hebrew-language responses, and
+relative-time resolution. Clone the repo and run it to see the whole loop.
 
 ---
 
 ## Example output
 
-`python report.py gen 20` (140 simulated runs). Abridged:
+`localize gen 20 --contract examples.salon.contract:SALON_CONTRACT` (140 simulated runs). Abridged:
 
 ```
 rows: 140   strict_pass_rate: 0.414   outcome_pass_rate: 0.793
@@ -78,7 +125,7 @@ rows: 140   strict_pass_rate: 0.414   outcome_pass_rate: 0.793
 And the self-check that makes the numbers trustworthy:
 
 ```
-$ python report.py validate 20
+$ localize validate 20 --contract examples.salon.contract:SALON_CONTRACT
    injected knob    rate   denom   expected         99% CI   measured   result
   premature_stop   0.080     140       11.2    [2.9, 19.5]         11     PASS
       wrong_tool   0.150     140       21.0   [10.1, 31.9]         21     PASS
@@ -114,20 +161,21 @@ into arg and response failures) — which is exactly what lets per-layer scores 
 ## Plug in a real agent
 
 The bundled simulator is a calibration weight — it exists so the grader can be validated.
-To evaluate a real ReAct agent, replace it and **nothing else**: run your agent over each
-gold row's user turns + scripted tool results, capture its steps as an `ObservedTrajectory`
-(the same shape the simulator emits), and the grader and report run unchanged.
+To evaluate a real agent, write your Contract (above), then run your agent over each
+gold row's user turns + scripted tool results and capture its steps as an
+`ObservedTrajectory` (the same shape the simulator emits). The grader and report
+run unchanged — no engine code to touch.
 
 ```python
-from grading import ObservedTrajectory, grade
-from judges import default_judge
+from localize import grade, ObservedTrajectory, default_judge
 
 observed = ObservedTrajectory(id=gold.id, steps=[
     {"step": 1, "behavior": "act", "tool": "check_availability",
      "args": {...}, "response_text": None},
     {"step": 2, "behavior": "respond", "response_text": "..."},
 ])
-report = grade(gold, observed, response_judge=default_judge())
+report = grade(gold, observed, contract=MY_CONTRACT,
+               response_judge=default_judge(contract=MY_CONTRACT))
 ```
 
 Validate the ruler first, then measure with it.
