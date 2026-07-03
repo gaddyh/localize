@@ -23,5 +23,5 @@ localize = "localize.cli:main"
 
 [tool.setuptools]
 packages = ["localize"]
-package-dir = {"localize" = "."}
+package-dir = {"localize" = "src/localize"}
 
