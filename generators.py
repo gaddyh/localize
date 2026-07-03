@@ -18,9 +18,9 @@ import math
 import random
 from typing import Optional
 
-from contract import Contract, ArgSource
-from dataset_models import DatasetRow
-from grading import ObservedTrajectory
+from .contract import Contract, ArgSource
+from .dataset_models import DatasetRow
+from .grading import ObservedTrajectory
 
 
 def _arg(value, source, fail_bucket=None, **kw):
@@ -403,16 +403,13 @@ def simulate_agent(gold: DatasetRow, profile: dict, rng: random.Random,
 
 
 def build_dataset(n_per_cell: int = 6, profile: Optional[dict] = None,
-                  seed: int = 7, contract: Optional[Contract] = None,
+                  seed: int = 7, contract: Contract = None,
                   fixtures: Optional[dict] = None):
     """Returns (cases, profile). cases = list of (label, gold, observed)."""
     if contract is None:
-        from examples.salon.contract import SALON_CONTRACT, FIXTURES
-        contract = SALON_CONTRACT
-        fixtures = fixtures or FIXTURES
+        raise ValueError("contract is required — pass your Contract explicitly.")
     if fixtures is None:
-        from examples.salon.contract import FIXTURES
-        fixtures = FIXTURES
+        raise ValueError("fixtures is required — pass your fixture dict explicitly.")
 
     profile = {**DEFAULT_PROFILE, **(profile or {})}
     rng = random.Random(seed)
@@ -478,7 +475,7 @@ def expected_knobs(cases, profile: dict, contract: Contract) -> list[dict]:
 def measured_knobs(reports, contract: Contract) -> dict:
     """Pull the measured count for each knob out of the grader aggregates.
     Uses contract.resolution_buckets to sum arg-resolution failures without drift."""
-    from grading import aggregate, behavior_pairs
+    from .grading import aggregate, behavior_pairs
     agg = aggregate(reports)
     arg = agg["arg_fail_buckets"]
     resp = agg["response_buckets"]
@@ -516,6 +513,7 @@ def validate(cases, reports, profile: dict, contract: Contract,
 
 
 if __name__ == "__main__":
-    cases, profile = build_dataset(n_per_cell=6, seed=7)
+    from examples.salon.contract import SALON_CONTRACT, FIXTURES
+    cases, profile = build_dataset(n_per_cell=6, seed=7, contract=SALON_CONTRACT, fixtures=FIXTURES)
     print(f"generated {len(cases)} runs across {len(set(l.split('#')[0] for l, _, _ in cases))} scenarios")
     print("profile:", profile)

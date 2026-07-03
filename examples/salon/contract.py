@@ -8,7 +8,7 @@ without touching any engine code (grading.py, generators.py, judges.py).
 
 from __future__ import annotations
 
-from contract import Contract, ToolArgSpec, ToolSpec
+from localize.contract import Contract, ToolArgSpec, ToolSpec
 
 SALON_CONTRACT = Contract(
     role_description=(

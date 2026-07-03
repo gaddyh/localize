@@ -9,7 +9,7 @@ for ('נקבע', 'אישור', 'BK-', ...). So:
     heuristic judge -> sees no marker      -> "handled"   (FALSE NEGATIVE)
     LLM judge       -> reads the meaning   -> "mishandled" (caught)
 
-Run:  python demo_llm_judge.py
+Run:  python -m examples.salon.demo_llm_judge
 """
 
 import random
@@ -17,9 +17,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from generators import make_gold, generate_scenario_grid
-from grading import grade, ObservedTrajectory, heuristic_response_judge
-from judges import default_judge
+from localize.generators import make_gold, generate_scenario_grid
+from localize.grading import grade, ObservedTrajectory, heuristic_response_judge
+from localize.judges import default_judge
 from examples.salon.contract import SALON_CONTRACT, FIXTURES
 
 # Build a book_error gold row via the contract-driven generator

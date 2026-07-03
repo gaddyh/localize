@@ -23,15 +23,13 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from grading import (
+from .grading import (
     aggregate,
     behavior_pairs,
     grade,
     per_layer_stats,
     tool_choice_pairs,
 )
-from examples_dataset import CASES
-from examples.salon.contract import SALON_CONTRACT
 
 
 def _ordered_labels(y_true, y_pred, tail=("(none)", "(no_call)")):
@@ -208,34 +206,34 @@ def run(reports, console: Console, title: str) -> None:
     render_buckets(console, reports)
 
 
-def main() -> None:
-    import sys
-    console = Console()
-    if len(sys.argv) > 1 and sys.argv[1] in ("gen", "validate"):
-        from generators import build_dataset, validate
-        n = int(sys.argv[2]) if len(sys.argv) > 2 else 8
-        use_llm = "llm" in sys.argv
-        judge = None
-        if use_llm:
-            from judges import default_judge
-            judge = default_judge(contract=SALON_CONTRACT)
-        cases, profile = build_dataset(n_per_cell=n, seed=7, contract=SALON_CONTRACT)
-        reports = [grade(gold, observed, contract=SALON_CONTRACT,
+def run_eval(contract, mode: str = "curated",
+             cases: list = None, fixtures: dict = None,
+             n: int = 8, judge=None,
+             console: Console = None) -> None:
+    """Generic grade-all-and-render driver.
+
+    mode: "curated" (uses provided cases), "gen" (builds dataset), "validate" (builds + validates).
+    For "gen"/"validate", fixtures is required — build_dataset needs it to produce concrete rows.
+    For "curated", fixtures is unused (cases are pre-built).
+    """
+    from .generators import build_dataset, validate
+    if console is None:
+        console = Console()
+    if mode in ("gen", "validate"):
+        cases_built, profile = build_dataset(
+            n_per_cell=n, seed=7, contract=contract, fixtures=fixtures)
+        reports = [grade(gold, observed, contract=contract,
                          **({"response_judge": judge} if judge else {}))
-                   for _, gold, observed in cases]
-        tag = " [LLM judge]" if use_llm else ""
-        if sys.argv[1] == "validate":
-            console.rule(f"[bold]Grader validation ({len(cases)} runs){tag}[/bold]")
-            rows = validate(cases, reports, profile, contract=SALON_CONTRACT)
-            render_validation(console, rows, len(cases))
+                   for _, gold, observed in cases_built]
+        tag = " [LLM judge]" if judge else ""
+        if mode == "validate":
+            console.rule(f"[bold]Grader validation ({len(cases_built)} runs){tag}[/bold]")
+            rows = validate(cases_built, reports, profile, contract=contract)
+            render_validation(console, rows, len(cases_built))
             console.print(f"[dim]injected agent profile: {profile}[/dim]")
         else:
-            run(reports, console, f"Generated volume ({len(cases)} runs){tag}")
+            run(reports, console, f"Generated volume ({len(cases_built)} runs){tag}")
             console.print(f"\n[dim]injected agent profile: {profile}[/dim]")
     else:
-        reports = [grade(gold, observed, contract=SALON_CONTRACT) for _, gold, observed in CASES]
+        reports = [grade(gold, observed, contract=contract) for _, gold, observed in cases]
         run(reports, console, "Curated dataset")
-
-
-if __name__ == "__main__":
-    main()

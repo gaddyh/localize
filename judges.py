@@ -22,8 +22,8 @@ from __future__ import annotations
 import json
 from typing import Callable, Optional
 
-from grading import Finding, ResponseContext
-from contract import Contract
+from .grading import Finding, ResponseContext
+from .contract import Contract
 
 from dotenv import load_dotenv
 

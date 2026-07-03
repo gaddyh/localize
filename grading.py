@@ -19,26 +19,15 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-try:  # works when run as a script from the same directory
-    from contract import Contract
-    from dataset_models import (
-        ActStep,
-        ArgSource,
-        Behavior,
-        ClarifyStep,
-        DatasetRow,
-        RespondStep,
-    )
-except ImportError:  # works when imported as part of a package
-    from .contract import Contract  # type: ignore
-    from .dataset_models import (  # type: ignore
-        ActStep,
-        ArgSource,
-        Behavior,
-        ClarifyStep,
-        DatasetRow,
-        RespondStep,
-    )
+from .contract import Contract
+from .dataset_models import (
+    ActStep,
+    ArgSource,
+    Behavior,
+    ClarifyStep,
+    DatasetRow,
+    RespondStep,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -61,6 +50,7 @@ class ObservedStep(BaseModel):
     tool: Optional[str] = None
     args: dict[str, ObservedArg] = {}
     response_text: Optional[str] = None
+    observation: Optional[dict[str, Any]] = None
 
     @field_validator("args", mode="before")
     @classmethod
@@ -795,85 +785,3 @@ def render_text_report(reports: list[GradeReport], title: str = "EVAL REPORT") -
     return "\n".join(out)
 
 
-# --------------------------------------------------------------------------- #
-# Demo: clean run, content-bug run, behavior-bug run                           #
-# --------------------------------------------------------------------------- #
-
-if __name__ == "__main__":
-    import json
-    from dataset_models import DatasetRow, EXAMPLE
-    from examples.salon.contract import SALON_CONTRACT
-
-    gold = DatasetRow.model_validate(EXAMPLE)
-
-    # ---- RUN A: agent does everything right ---- #
-    good = ObservedTrajectory(
-        id=gold.id,
-        steps=[
-            {"step": 1, "behavior": "act", "tool": "check_availability",
-             "args": {"service": "gel_polish",
-                      "date_range": "2026-06-29..2026-07-04"}},
-            {"step": 2, "behavior": "respond",
-             "response_text": "יש לי שני תורים: ראשון 2026-06-29 14:00 או 2026-07-01 10:30."},
-            {"step": 3, "behavior": "act", "tool": "book_appointment",
-             "args": {"service": "gel_polish", "date": "2026-06-29",
-                      "time": "14:00", "customer_name": "מאיה לוי"}},
-            {"step": 4, "behavior": "respond",
-             "response_text": "מעולה, נקבע לך תור ל-2026-06-29 בשעה 14:00. אישור: BK-5512."},
-        ],
-    )
-
-    # ---- RUN B: several distinct bugs, one per layer ---- #
-    bad = ObservedTrajectory(
-        id=gold.id,
-        steps=[
-            # arg bug: wrong relative-time resolution
-            {"step": 1, "behavior": "act", "tool": "check_availability",
-             "args": {"service": "gel_polish",
-                      "date_range": "2026-07-06..2026-07-11"}},  # wrong week
-            # response bug: claims a booking that never happened
-            {"step": 2, "behavior": "respond",
-             "response_text": "מעולה, כבר נקבע לך תור!"},        # 'נקבע' = booking claim
-            # arg bug: books the OTHER slot (forbidden value)
-            {"step": 3, "behavior": "act", "tool": "book_appointment",
-             "args": {"service": "gel_polish", "date": "2026-07-01",
-                      "time": "10:30", "customer_name": "מאיה לוי"}},
-            # response bug: confirms the wrong slot
-            {"step": 4, "behavior": "respond",
-             "response_text": "נקבע ל-2026-07-01 בשעה 10:30. אישור BK-5512."},
-        ],
-    )
-
-    # ---- RUN C: behavior-level bugs (over-clarify, eager-act, premature stop) ---- #
-    behavior_bug = ObservedTrajectory(
-        id=gold.id,
-        steps=[
-            # over-clarify: gold says act, agent asks instead of looking up
-            {"step": 1, "behavior": "clarify",
-             "response_text": "באיזה יום בדיוק?"},
-            # eager-act: gold says respond, agent books before the user chose
-            {"step": 2, "behavior": "act", "tool": "book_appointment",
-             "args": {"service": "gel_polish", "date": "2026-06-29", "time": "14:00",
-                      "customer_name": "מאיה לוי"}},
-            # correct act
-            {"step": 3, "behavior": "act", "tool": "book_appointment",
-             "args": {"service": "gel_polish", "date": "2026-06-29", "time": "14:00",
-                      "customer_name": "מאיה לוי"}},
-            # step 4 (gold respond) never produced -> premature_stop
-        ],
-    )
-
-    runs = [("RUN A (clean)", good), ("RUN B (content bugs)", bad),
-            ("RUN C (behavior bugs)", behavior_bug)]
-
-    reports = []
-    for label, obs in runs:
-        rep = grade(gold, obs, contract=SALON_CONTRACT)
-        reports.append(rep)
-        print(f"\n----- {label}: strict_pass={rep.strict_pass} "
-              f"outcome_pass={rep.outcome_pass} -----")
-        for sg in rep.step_grades:
-            for f in sg.failures:
-                print(f"  step {f.step} [{f.layer}/{f.code}] {f.detail}")
-
-    print(render_text_report(reports, title="DATASET REPORT (A + B + C)"))
