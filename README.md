@@ -23,7 +23,7 @@ can't tell you. `localize` grades **five independent surfaces** of every run and
 > returns *no availability* or *error*, the agent still claims success ~30% of the time.
 
 That sentence points at an engineering task. And because the grader is **validated against
-a known ground truth**, you can trust the number — see [docs/design.md](docs/design.md)
+a known ground truth**, you can trust the number — see [docs/Design.md](docs/Design.md)
 for how (and the real bug it caught).
 
 ---
@@ -138,7 +138,7 @@ $ localize validate 20 --contract examples.salon.contract:SALON_CONTRACT
 
 The fake agent makes mistakes at rates *you choose*, so the grader can be checked against a
 known answer. This caught a real over-detecting LLM judge during development (37 vs ~15)
-**before it ever touched a real model** — story in [docs/design.md](docs/design.md).
+**before it ever touched a real model** — story in [docs/Design.md](docs/Design.md).
 
 ---
 
@@ -184,7 +184,7 @@ Validate the ruler first, then measure with it.
 
 ## Learn more
 
-- **[docs/design.md](docs/Design.md)** — the full rationale: how the schema and scenarios
+- **[docs/Design.md](docs/Design.md)** — the full rationale: how the schema and scenarios
   were *derived* (not decreed), how "deterministic variety" works, why the self-validation
   isn't circular, and the LLM-judge design.
 - Inspired by [τ²-bench](https://github.com/sierra-research/tau2-bench) (Sierra Research &
